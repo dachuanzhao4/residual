@@ -16,7 +16,6 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-import wandb
 
 from collections import defaultdict
 from typing import Tuple, List, Dict, Optional
@@ -29,6 +28,7 @@ from models.vit import Classifier, PRESET_VIT
 from models.ortho_models import OrthoBlock
 from connect import _METRICS, ConnStat, set_connect
 from data.datasets import get_dataset
+from utils.metric_logger import build_metric_logger, MetricLogger
 
 def parse_connect_schedule(spec: str | None) -> list[tuple[int, str]]:
     """
@@ -290,6 +290,7 @@ def main(args):
     run_name = f"{args.model}-{args.preset}/{patch_size}_{initial_connect}_{ortho_method}_{args.dataset}_seed{args.seed}"
     print(f"Run name: {run_name}")
 
+    metric_logger: MetricLogger
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
         experiment_index = len(glob(f"{args.results_dir}/*"))
@@ -299,9 +300,24 @@ def main(args):
         os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir, args.debug)
         logger.info(f"Experiment directory created at {experiment_dir}")
-        wandb.init(project=args.project, config=vars(args), name=f"{run_name}-{experiment_index:03d}")
+        metric_logger = build_metric_logger(
+            backend=args.log_backend,
+            is_main_process=True,
+            log_dir=experiment_dir,
+            project=args.project,
+            run_name=f"{run_name}-{experiment_index:03d}",
+            config=vars(args),
+        )
     else:
         logger = create_logger(None)
+        metric_logger = build_metric_logger(
+            backend=args.log_backend,
+            is_main_process=False,
+            log_dir=None,
+            project=args.project,
+            run_name=run_name,
+            config=vars(args),
+        )
 
     # Set the seed for reproducibility (unique for each rank)
     torch.manual_seed(args.seed + rank)
@@ -768,8 +784,7 @@ def main(args):
                             f"{acc_log}"
                         )
 
-                        # Log training metrics to a separate table in wandb
-                        wandb.log(
+                        metric_logger.log(
                             {
                                 "train/loss": avg_train_loss,
                                 "train/step": train_steps,
@@ -779,7 +794,10 @@ def main(args):
                                 **{f"train/{k}": v for k, v in grad_log.items()},
                                 **{f"activation/{k}": v for k, v in buf_log.items()},
                                 **{f"activation/{k}": v for k, v in aggregated_log.items()},
-                            }, step=train_steps)
+                            },
+                            step=train_steps,
+                            epoch=epoch,
+                        )
 
                     # Reset tracking variables for the next logging interval
                     running_loss, log_steps = 0.0, 0
@@ -828,14 +846,16 @@ def main(args):
             lr_scheduler.step(val_loss)
     
         if rank == 0:
-            # Log validation metrics to a separate table in wandb
-            wandb.log({
-                "val/loss": logs["val_loss"],
-                "val/acc@1": logs["val_acc@1"],
-                "val/acc@5": logs["val_acc@5"],
-                "epoch": epoch,
-                "val/step": train_steps,  # Use the same step counter for alignment
-            }, step=train_steps)
+            metric_logger.log(
+                {
+                    "val/loss": logs["val_loss"],
+                    "val/acc@1": logs["val_acc@1"],
+                    "val/acc@5": logs["val_acc@5"],
+                    "val/step": train_steps,
+                },
+                step=train_steps,
+                epoch=epoch,
+            )
             
             logger.info(
                 f"Epoch {epoch+1}/{args.epochs} "
@@ -848,7 +868,7 @@ def main(args):
     logger.info("Done!")
     dist.barrier()
     if rank == 0:
-        wandb.finish()
+        metric_logger.close()
     # Clean up the distributed process group
     dist.destroy_process_group()
 
@@ -856,6 +876,12 @@ if __name__ == "__main__":
     # Parse arguments, including global batch size
     parser = argparse.ArgumentParser()
     parser.add_argument("--project", type=str, default="ortho-classifier",)
+    parser.add_argument(
+        "--log_backend",
+        type=str,
+        default="csv",
+        help="Comma-separated backends: csv, wandb, wandb,csv, none. Only rank0 logs.",
+    )
     parser.add_argument("--config_file", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     
