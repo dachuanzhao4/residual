@@ -94,6 +94,17 @@ def main() -> None:
     args.summary_csv.parent.mkdir(parents=True, exist_ok=True)
 
     records: list[dict] = []
+    seen: set[tuple[str, int]] = set()
+    if args.summary_csv.exists():
+        with args.summary_csv.open("r", newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                if not row:
+                    continue
+                method = str(row.get("method", ""))
+                seed = int(row.get("seed", "0"))
+                records.append(row)
+                seen.add((method, seed))
 
     for method, cfg in methods.items():
         if not cfg.exists():
@@ -102,6 +113,9 @@ def main() -> None:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         for seed in args.seeds:
+            if (method, seed) in seen:
+                print(f"Skipping existing: {method} seed={seed}")
+                continue
             before = capture_dirs(out_dir)
             cmd = [
                 args.torchrun,
@@ -145,6 +159,7 @@ def main() -> None:
 
             record = {"method": method, "seed": seed, "run_dir": str(run_dir), **metrics}
             records.append(record)
+            seen.add((method, seed))
 
             with args.summary_csv.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.DictWriter(handle, fieldnames=list(records[0].keys()))
@@ -153,7 +168,7 @@ def main() -> None:
 
     print("\n=== Summary (best_acc1 mean±std over seeds) ===")
     for method in methods.keys():
-        vals = [r["best_acc1"] for r in records if r["method"] == method]
+        vals = [float(r["best_acc1"]) for r in records if r["method"] == method]
         if not vals:
             continue
         mu = mean(vals)
@@ -165,4 +180,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
