@@ -13,7 +13,7 @@ sde_trainable: true
 sde_alpha_init: 1.0e-4
 sde_beta_scale_init: -20.0
 sde_sigma2: 1.0
-sde_noise_mode: off
+sde_noise_mode: "off"
 sde_param_lr_mult: 0.1
 sde_param_weight_decay: 0.0
 
@@ -48,4 +48,3 @@ randaugment_M: 5
 
 torch_compile: false
 log_activations: true
-

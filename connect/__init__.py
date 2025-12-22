@@ -816,7 +816,15 @@ class ConnLoggerMixin:
 
         sigma2 = getattr(self, "sde_sigma2", 1.0)
         noise_mode = getattr(self, "sde_noise_mode", "train")
-        noise_mode = (noise_mode or "train").strip().lower()
+        noise_mode = (noise_mode or "train")
+        # YAML 1.1 treats "off"/"on" as booleans; be forgiving for configs.
+        if isinstance(noise_mode, bool):
+            noise_mode = "off" if not noise_mode else "train"
+        noise_mode = str(noise_mode).strip().lower()
+        if noise_mode in ("false", "0", "no", "off"):
+            noise_mode = "off"
+        elif noise_mode in ("true", "1", "yes", "on"):
+            noise_mode = "train"
         if noise_mode not in ("train", "always", "off"):
             raise ValueError(f"unknown sde_noise_mode: {noise_mode}")
         apply_noise = (noise_mode == "always") or (noise_mode == "train" and self.training)
