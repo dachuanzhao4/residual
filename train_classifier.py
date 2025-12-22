@@ -467,15 +467,44 @@ def main(args):
     if rank == 0:
         logger.info(model.module)
         log_residual_patterns(logger, model)
+
+    # Optimizer param groups (keep SDE scalars stable: low LR, no WD)
+    trainable_sde_params: list[torch.nn.Parameter] = []
+    other_params: list[torch.nn.Parameter] = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if ("sde_raw_alpha" in name) or ("sde_raw_beta_scale" in name):
+            trainable_sde_params.append(param)
+        else:
+            other_params.append(param)
+
+    param_groups = [{"params": other_params, "lr": args.lr, "weight_decay": args.weight_decay}]
+    if trainable_sde_params:
+        param_groups.append({
+            "params": trainable_sde_params,
+            "lr": args.lr * args.sde_param_lr_mult,
+            "weight_decay": args.sde_param_weight_decay,
+        })
+        if rank == 0:
+            logger.info(
+                "SDE param group: n=%d lr=%g wd=%g (base lr=%g wd=%g)",
+                len(trainable_sde_params),
+                args.lr * args.sde_param_lr_mult,
+                args.sde_param_weight_decay,
+                args.lr,
+                args.weight_decay,
+            )
+
     if args.optimizer == "adam":
         betas = (args.adam_beta1, args.adam_beta2)
         optimizer = torch.optim.Adam(
-            model.parameters(), lr=args.lr, betas=betas, weight_decay=args.weight_decay,
+            param_groups, betas=betas,
             fused=True,
         )
     elif args.optimizer == "sgd":
         optimizer = torch.optim.SGD(
-            model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay,
+            param_groups, momentum=args.momentum,
             fused=True,
         )
     else:
@@ -884,6 +913,18 @@ if __name__ == "__main__":
     parser.add_argument("--sde_alpha_init", type=float, default=1e-3, help="Init alpha when --sde_trainable.")
     parser.add_argument("--sde_beta_scale_init", type=float, default=0.0, help="Init log-scale for beta coupling when --sde_trainable.")
     parser.add_argument("--sde_noise_mode", type=str, default="train", choices=["train", "always", "off"], help="When to apply radial noise.")
+    parser.add_argument(
+        "--sde_param_lr_mult",
+        type=float,
+        default=0.1,
+        help="LR multiplier for trainable SDE scalars (raw alpha/beta); keep small for stability.",
+    )
+    parser.add_argument(
+        "--sde_param_weight_decay",
+        type=float,
+        default=0.0,
+        help="Weight decay for trainable SDE scalars (raw alpha/beta).",
+    )
     parser.add_argument("--mlp_dropout", type=float, default=0.0)
     parser.add_argument("--drop_path", type=float, default=0.0)
     parser.add_argument("--is_layernorm_classifier", action="store_true",
