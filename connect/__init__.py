@@ -432,7 +432,9 @@ def connect(
             noise = beta_fp32 * xi
             apply_noise_val = torch.tensor([1.0], device=x.device)
         else:
-            noise = torch.zeros_like(drift)
+            # Keep beta in the graph even when noise is disabled (e.g. drift-only runs),
+            # otherwise DDP can complain about unused parameters for trainable beta scales.
+            noise = torch.zeros_like(drift) + (beta_fp32 * 0.0)
             apply_noise_val = torch.tensor([0.0], device=x.device)
 
         delta_r = drift + noise
