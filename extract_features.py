@@ -7,11 +7,11 @@ import os
 import numpy as np
 from tqdm import tqdm
 
-from base import Classifier, PRESET_VIT
-from preactresnet import PRESET_PREACT_RESNET
+from models.vit import Classifier, PRESET_VIT
+from models.preactresnet import PRESET_PREACT_RESNET, PreActResNet
 # from connect import set_connect
-from data_utils import get_dataset
-from ortho_models import OrthoBlock
+from data.datasets import get_dataset
+from models.ortho_models import OrthoBlock
 
 
 def load_checkpoint(ckpt_path):
@@ -70,7 +70,6 @@ def create_model_for_features(args, state_dict):
         assert model_name in PRESET_PREACT_RESNET, f"Unknown PreActResNet preset: {model_name}"
         depths = PRESET_PREACT_RESNET[model_name]
         
-        from preactresnet import PreActResNet
         model = PreActResNet(
             depths=depths,
             input_shape=(in_chans, getattr(args, 'image_size', 224), getattr(args, 'image_size', 224)),

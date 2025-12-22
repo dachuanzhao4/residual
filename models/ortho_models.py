@@ -1,9 +1,10 @@
 import torch
 import torch.nn as nn
+import math
 from timm.layers import DropPath, Mlp
 from timm.models.vision_transformer import Attention
 from connect import ConnLoggerMixin
-from gradient_checkpointing import Unsloth_Offloaded_Gradient_Checkpointer
+from .gradient_checkpointing import Unsloth_Offloaded_Gradient_Checkpointer
 
 
 class OrthoBlock(ConnLoggerMixin, nn.Module):
@@ -22,6 +23,14 @@ class OrthoBlock(ConnLoggerMixin, nn.Module):
         residual_perturbation=None,
     residual_pattern="default",
     residual_rescale_mode="scalar",
+        # Neural SDE (radial) options (used when residual_connection="sde"/"chi"/"radial_sde")
+        sde_alpha: float = 0.0,
+        sde_beta: float | None = None,
+        sde_sigma2: float = 1.0,
+        sde_trainable: bool = False,
+        sde_alpha_init: float = 1e-3,
+        sde_beta_scale_init: float = 0.0,
+        sde_noise_mode: str = "train",  # "train" | "always" | "off"
         modulate=True,
         mlp_dropout=0.0,
         drop_path=0.0,
@@ -65,6 +74,15 @@ class OrthoBlock(ConnLoggerMixin, nn.Module):
             self.grad_ckpt = gradient_checkpointing
 
         self._init_pattern_state(hidden_size, pattern, rescale_mode)
+        self._init_sde_state(
+            sde_alpha=sde_alpha,
+            sde_beta=sde_beta,
+            sde_sigma2=sde_sigma2,
+            sde_trainable=sde_trainable,
+            sde_alpha_init=sde_alpha_init,
+            sde_beta_scale_init=sde_beta_scale_init,
+            sde_noise_mode=sde_noise_mode,
+        )
 
 
     def set_step_fn(self, fn):      # 한 번만 호출
@@ -114,3 +132,34 @@ class OrthoBlock(ConnLoggerMixin, nn.Module):
                 raise ValueError("residual_rescale_mode='conv1x1' is not supported for ViT blocks")
             self._pattern_params["attn_rescale_alpha"] = nn.Parameter(torch.zeros(1))
             self._pattern_params["mlp_rescale_alpha"] = nn.Parameter(torch.zeros(1))
+
+    def _init_sde_state(
+        self,
+        *,
+        sde_alpha: float,
+        sde_beta: float | None,
+        sde_sigma2: float,
+        sde_trainable: bool,
+        sde_alpha_init: float,
+        sde_beta_scale_init: float,
+        sde_noise_mode: str,
+    ) -> None:
+        # Fixed coefficients fallback (used when no trainable params are registered).
+        self.sde_alpha = float(sde_alpha)
+        self.sde_beta = None if sde_beta is None else float(sde_beta)
+        self.sde_sigma2 = float(sde_sigma2)
+        self.sde_noise_mode = str(sde_noise_mode)
+
+        if not sde_trainable:
+            return
+
+        def inv_softplus(x: float) -> float:
+            x = max(float(x), 1e-12)
+            return math.log(math.expm1(x))
+
+        raw_alpha_init = torch.tensor([inv_softplus(sde_alpha_init)], dtype=torch.float32)
+        beta_scale_init = torch.tensor([float(sde_beta_scale_init)], dtype=torch.float32)
+        self._pattern_params["attn_sde_raw_alpha"] = nn.Parameter(raw_alpha_init.clone())
+        self._pattern_params["mlp_sde_raw_alpha"] = nn.Parameter(raw_alpha_init.clone())
+        self._pattern_params["attn_sde_raw_beta_scale"] = nn.Parameter(beta_scale_init.clone())
+        self._pattern_params["mlp_sde_raw_beta_scale"] = nn.Parameter(beta_scale_init.clone())

@@ -56,7 +56,7 @@ def get_dataset(args):
             ]
         )
     elif name == "cifar10":
-        dataset = load_dataset("uoft-cs/cifar10")
+        dataset = load_dataset("cifar10")
         in_chans = 3
         image_key = "img"
         label_key = "label"
@@ -100,7 +100,7 @@ def get_dataset(args):
                 ]
             )
     elif name == "cifar100":
-        dataset = load_dataset("uoft-cs/cifar100")
+        dataset = load_dataset("cifar100")
         in_chans = 3
         image_key = "img"
         label_key = "fine_label"

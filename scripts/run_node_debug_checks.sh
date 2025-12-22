@@ -129,9 +129,9 @@ run_and_validate() {
   echo "[OK] Expected pattern parameters logged for ${tag}."
 }
 
-run_and_validate 1 recipes/debug_vit.yaml linear rezero 6 '' "attn_alpha" "mlp_alpha"
-run_and_validate 1 recipes/debug_resnet.yaml orthogonal rezero_constrained 6 '' "conv_theta"
-run_and_validate 1 recipes/debug_resnet.yaml orthogonal rescale_stream 6 scalar "conv_rescale_alpha"
-run_and_validate 1 recipes/debug_resnet.yaml orthogonal rescale_stream 6 conv1x1 "conv_rescale_proj"
+run_and_validate 1 configs/debug_vit.yaml linear rezero 6 '' "attn_alpha" "mlp_alpha"
+run_and_validate 1 configs/debug_resnet.yaml orthogonal rezero_constrained 6 '' "conv_theta"
+run_and_validate 1 configs/debug_resnet.yaml orthogonal rescale_stream 6 scalar "conv_rescale_alpha"
+run_and_validate 1 configs/debug_resnet.yaml orthogonal rescale_stream 6 conv1x1 "conv_rescale_proj"
 
 echo "\nAll checks completed. Logs stored under ${RESULTS_ROOT}."

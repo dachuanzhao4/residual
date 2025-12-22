@@ -36,6 +36,14 @@ _KNOWN_PATTERNS = (
     "rescale_stream",
 )
 
+_METHOD_ALIASES = {
+    "radial_sde": "sde",
+    "chi": "sde",
+    "chi_sde": "sde",
+    "orthogonal_sde": "sde",
+    "ours": "sde",
+}
+
 @dataclass
 class ConnStat:
     module_name  : str   # module name (e.g. attn, mlp, conv)
@@ -317,6 +325,10 @@ def connect(
     eps: float | torch.Tensor = 1e-6,
     perturbation: Optional[float] = None,
     pattern: Optional[str] = None,
+    sde_alpha: Optional[torch.Tensor] = None,
+    sde_beta: Optional[torch.Tensor] = None,
+    sde_sigma2: float | torch.Tensor = 1.0,
+    sde_noise: bool = True,
     alpha: Optional[torch.Tensor] = None,
     theta: Optional[torch.Tensor] = None,
     rescale_alpha: Optional[torch.Tensor] = None,
@@ -327,6 +339,7 @@ def connect(
         f_x = f_x + torch.randn_like(f_x) * perturbation
 
     method, pattern = _normalize_method_and_pattern(method, pattern)
+    method = _METHOD_ALIASES.get(method, method)
 
     if isinstance(eps, float):
         eps_tensor = torch.tensor([eps], device=x.device, dtype=torch.float32)
@@ -370,6 +383,80 @@ def connect(
             f_par=f_par,
             f_ortho=f_ortho,
         )
+    elif method == "sde":
+        if pattern not in ("default", "none"):
+            raise ValueError("sde connect method currently supports pattern 'default'/'none' only")
+        if sde_alpha is None:
+            raise ValueError("sde connect method requires sde_alpha tensor")
+        if sde_beta is None:
+            raise ValueError("sde connect method requires sde_beta tensor")
+
+        if orthogonal_method == "global":
+            results_with_stat = _orthogonal_global(x, f_x, dim, eps_tensor)
+        elif orthogonal_method == "feature":
+            results_with_stat = _orthogonal_channel(x, f_x, dim, eps_tensor)
+        else:
+            raise ValueError(f"unknown orthogonal method: {orthogonal_method}")
+
+        f_ortho, results = results_with_stat
+
+        # Radial SDE (Chi / isotropic Gaussian radius target)
+        # d = feature dimension of each residual vector
+        d = int(x.size(dim))
+        sigma2 = sde_sigma2
+        if isinstance(sigma2, float):
+            if sigma2 <= 0:
+                raise ValueError("sde_sigma2 must be > 0")
+            sigma2_t = torch.tensor([sigma2], device=x.device, dtype=torch.float32)
+        else:
+            sigma2_t = sigma2.to(device=x.device, dtype=torch.float32).clamp_min(1e-12)
+
+        # r in fp32 for stability (shape keeps dim)
+        if results.x_norm2 is None:
+            x_norm2 = (x * x).sum(dim, keepdim=True).float().clamp_min(eps_tensor)
+            results.x_norm2 = x_norm2
+        else:
+            x_norm2 = results.x_norm2.float().clamp_min(eps_tensor)
+
+        r = torch.sqrt(x_norm2)
+        inv_r = 1.0 / r
+        alpha_fp32 = sde_alpha.to(device=x.device, dtype=torch.float32)
+        beta_fp32 = sde_beta.to(device=x.device, dtype=torch.float32)
+
+        drift = alpha_fp32 * (((d - 1.0) * inv_r) - (r / sigma2_t))
+        entropy_term = (d - 1.0) * inv_r
+        restoring_term = -(r / sigma2_t)
+
+        if sde_noise and torch.any(beta_fp32 > 0):
+            xi = torch.randn_like(r)
+            noise = beta_fp32 * xi
+            apply_noise_val = torch.tensor([1.0], device=x.device)
+        else:
+            noise = torch.zeros_like(drift)
+            apply_noise_val = torch.tensor([0.0], device=x.device)
+
+        delta_r = drift + noise
+        u = x / r.to(dtype=x.dtype)
+        delta_x_rad = delta_r.to(dtype=x.dtype) * u
+
+        stream = x + f_ortho + delta_x_rad
+        results.stream = stream
+        results.pattern = pattern
+        results.extras["sde_alpha"] = alpha_fp32.detach()
+        results.extras["sde_beta"] = beta_fp32.detach()
+        results.extras["sde_sigma2"] = sigma2_t.detach()
+        results.extras["sde_apply_noise"] = apply_noise_val
+        results.extras["sde_r_mean"] = r.detach().mean()
+        results.extras["sde_r_std"] = r.detach().std(unbiased=False)
+        results.extras["sde_entropy_mean"] = entropy_term.detach().mean()
+        results.extras["sde_restoring_mean"] = restoring_term.detach().mean()
+        results.extras["sde_drift_mean"] = drift.detach().mean()
+        results.extras["sde_noise_mean"] = noise.detach().mean()
+        results.extras["sde_delta_r_rms"] = torch.sqrt((delta_r * delta_r).detach().mean().clamp_min(0.0))
+        delta_x_rad_norm2 = (delta_x_rad.detach() * delta_x_rad.detach()).sum(dim, keepdim=True).mean()
+        results.extras["sde_delta_x_rad_norm2"] = delta_x_rad_norm2
+        results.extras["sde_rho_rad"] = (delta_x_rad_norm2 / x_norm2.detach().mean().clamp_min(eps_tensor)).detach()
+        return stream, results
     elif method == "orthogonal":
         if orthogonal_method == "global":
             results_with_stat = _orthogonal_global(x, f_x, dim, eps_tensor)
@@ -655,6 +742,7 @@ class ConnLoggerMixin:
             if eps.device != x.device:
                 raise RuntimeError(f"eps on {eps.device}, x on {x.device}")   # for debug
         pattern_kwargs = self._pattern_kwargs(tag, pattern, rescale_mode)
+        method_kwargs = self._method_kwargs(tag, method, x)
         stream, results = connect(
             x, out,
             dim=vec_dim,
@@ -662,6 +750,7 @@ class ConnLoggerMixin:
             perturbation=perturbation, eps=eps,
             pattern=pattern,
             **pattern_kwargs,
+            **method_kwargs,
         )
         stream = stream.to(x.dtype)
         
@@ -718,6 +807,40 @@ class ConnLoggerMixin:
             }
 
         raise ValueError(f"unknown residual pattern '{pattern}'")
+
+    def _method_kwargs(self, tag: str, method: str, x: torch.Tensor) -> Dict[str, Any]:
+        method_norm = (method or "").strip().lower().replace("-", "_")
+        method_norm = _METHOD_ALIASES.get(method_norm, method_norm)
+        if method_norm != "sde":
+            return {}
+
+        sigma2 = getattr(self, "sde_sigma2", 1.0)
+        noise_mode = getattr(self, "sde_noise_mode", "train")
+        noise_mode = (noise_mode or "train").strip().lower()
+        if noise_mode not in ("train", "always", "off"):
+            raise ValueError(f"unknown sde_noise_mode: {noise_mode}")
+        apply_noise = (noise_mode == "always") or (noise_mode == "train" and self.training)
+
+        raw_alpha_key = f"{tag}_sde_raw_alpha"
+        raw_beta_scale_key = f"{tag}_sde_raw_beta_scale"
+        if isinstance(self._pattern_params, nn.ParameterDict) and raw_alpha_key in self._pattern_params:
+            raw_alpha = self._pattern_params[raw_alpha_key]
+            alpha = F.softplus(raw_alpha)
+            if raw_beta_scale_key in self._pattern_params:
+                beta_scale = self._pattern_params[raw_beta_scale_key]
+                beta = torch.sqrt(2.0 * alpha) * torch.exp(beta_scale)
+            else:
+                beta = torch.sqrt(2.0 * alpha)
+            return {"sde_alpha": alpha, "sde_beta": beta, "sde_sigma2": sigma2, "sde_noise": apply_noise}
+
+        alpha_val = float(getattr(self, "sde_alpha", 0.0))
+        beta_val = getattr(self, "sde_beta", None)
+        alpha = torch.tensor([alpha_val], device=x.device, dtype=torch.float32)
+        if beta_val is None:
+            beta = torch.sqrt(2.0 * alpha)
+        else:
+            beta = torch.tensor([float(beta_val)], device=x.device, dtype=torch.float32)
+        return {"sde_alpha": alpha, "sde_beta": beta, "sde_sigma2": sigma2, "sde_noise": apply_noise}
 
     @_disable_dynamo
     def _store_stats(self, tag: str, block_id: int, results: RawConnStat):

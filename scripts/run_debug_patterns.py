@@ -3,7 +3,7 @@
 
 This helper is intended to be executed **after** logging into the target node
 and activating the desired Python environment.  It iterates over the debug
-recipes (default: ``recipes/debug*.yaml``), sweeps through residual connection
+recipes (default: ``configs/debug*.yaml``), sweeps through residual connection
 methods (linear / orthogonal) and residual patterns (default, rezero,
 rezero_constrained, rescale_stream), and launches ``train_classifier.py`` runs
 with a very small number of steps to validate that activation metrics are
@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         nargs="*",
         default=None,
-        help="Explicit list of recipe files to run. When omitted all recipes/debug*.yaml files are used.",
+        help="Explicit list of recipe files to run. When omitted all configs/debug*.yaml files are used.",
     )
     parser.add_argument(
         "--results-root",
@@ -110,7 +110,7 @@ def parse_args() -> argparse.Namespace:
 def discover_recipes(recipe_args: Sequence[str] | None) -> List[Path]:
     if recipe_args:
         return [Path(path).resolve() for path in recipe_args]
-    return sorted(Path("recipes").glob("debug*.yaml"))
+    return sorted(Path("configs").glob("debug*.yaml"))
 
 
 def load_model_name(recipe_path: Path) -> str:
@@ -209,7 +209,7 @@ def main() -> None:
     args = parse_args()
     recipes = discover_recipes(args.recipes)
     if not recipes:
-        raise SystemExit("No recipes found. Provide --recipes or populate recipes/debug*.yaml.")
+        raise SystemExit("No recipes found. Provide --recipes or populate configs/debug*.yaml.")
 
     methods = args.methods or DEFAULT_METHODS
     patterns = args.patterns or DEFAULT_PATTERNS

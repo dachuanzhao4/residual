@@ -24,11 +24,47 @@ from typing import Tuple, List, Dict, Optional
 from timm.data import Mixup
 from timm.loss import SoftTargetCrossEntropy
 
-from preactresnet import PRESET_PREACT_RESNET
-from base import Classifier, PRESET_VIT
-from ortho_models import OrthoBlock
+from models.preactresnet import PRESET_PREACT_RESNET
+from models.vit import Classifier, PRESET_VIT
+from models.ortho_models import OrthoBlock
 from connect import _METRICS, ConnStat, set_connect
-from data_utils import get_dataset
+from data.datasets import get_dataset
+
+def parse_connect_schedule(spec: str | None) -> list[tuple[int, str]]:
+    """
+    Parse a connect schedule string like "0:orthogonal,150:linear" into a sorted list.
+    """
+    if spec is None:
+        return []
+    spec = spec.strip()
+    if not spec:
+        return []
+    schedule: list[tuple[int, str]] = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            raise ValueError(f"invalid connect_schedule entry: '{part}' (expected 'epoch:method')")
+        epoch_s, method = part.split(":", 1)
+        schedule.append((int(epoch_s), method.strip()))
+    schedule.sort(key=lambda x: x[0])
+    return schedule
+
+
+def connect_method_for_epoch(
+    schedule: list[tuple[int, str]],
+    epoch: int,
+    *,
+    default: str,
+) -> str:
+    method = default
+    for start_epoch, scheduled_method in schedule:
+        if epoch >= start_epoch:
+            method = scheduled_method
+        else:
+            break
+    return method
 
 def create_logger(logging_dir, debug: bool = False):
     """
@@ -240,11 +276,18 @@ def main(args):
     world_size = dist.get_world_size()
     seed = args.seed * dist.get_world_size() + rank
     print(f"Starting rank={rank}, world_size={dist.get_world_size()}. local seed={seed}. global batch size={args.global_batch_size}.")
-    res_conn = "orthogonal" if args.orthogonal_residual else "linear"
-    ortho_method = args.orthogonal_method if args.orthogonal_residual else "linear"
+    if args.residual_connection is not None:
+        res_conn = args.residual_connection
+    else:
+        res_conn = "orthogonal" if args.orthogonal_residual else "linear"
+
+    schedule = parse_connect_schedule(args.connect_schedule)
+    initial_connect = connect_method_for_epoch(schedule, 0, default=res_conn)
+
+    ortho_method = args.orthogonal_method if initial_connect in ("orthogonal", "sde", "chi", "chi_sde", "radial_sde", "orthogonal_sde", "ours") else "linear"
     if args.orthogonal_method == "negative":
         ortho_method = "negative"
-    run_name = f"{args.model}-{args.preset}/{patch_size}_{res_conn}_{ortho_method}_{args.dataset}_seed{args.seed}"
+    run_name = f"{args.model}-{args.preset}/{patch_size}_{initial_connect}_{ortho_method}_{args.dataset}_seed{args.seed}"
     print(f"Run name: {run_name}")
 
     if rank == 0:
@@ -337,6 +380,13 @@ def main(args):
             residual_perturbation=args.orthogonal_perturbation,
             residual_pattern=args.residual_pattern,
             residual_rescale_mode=args.residual_rescale_mode,
+            sde_alpha=args.sde_alpha,
+            sde_beta=args.sde_beta,
+            sde_sigma2=args.sde_sigma2,
+            sde_trainable=args.sde_trainable,
+            sde_alpha_init=args.sde_alpha_init,
+            sde_beta_scale_init=args.sde_beta_scale_init,
+            sde_noise_mode=args.sde_noise_mode,
             # Activation & training logs share the same interval now
             log_interval=args.log_interval,
             log_activations=(rank == 0 and args.log_activations),
@@ -367,6 +417,13 @@ def main(args):
             residual_perturbation=args.orthogonal_perturbation,
             residual_pattern=args.residual_pattern,
             residual_rescale_mode=args.residual_rescale_mode,
+            sde_alpha=args.sde_alpha,
+            sde_beta=args.sde_beta,
+            sde_sigma2=args.sde_sigma2,
+            sde_trainable=args.sde_trainable,
+            sde_alpha_init=args.sde_alpha_init,
+            sde_beta_scale_init=args.sde_beta_scale_init,
+            sde_noise_mode=args.sde_noise_mode,
             modulate=False,
             mlp_dropout=args.mlp_dropout,
             # Activation & training logs share the same interval now
@@ -386,6 +443,10 @@ def main(args):
             raise ValueError(f"Invalid pattern: {args.orthogonal_pattern}. Must be less than {len(base_model.blocks)}.")
         i = 0
         set_connect(base_model, pattern=pattern, logger=logger)
+
+    # Apply connect schedule initial state (also supports torch.compile via set_connect).
+    if schedule:
+        set_connect(base_model, default=initial_connect, logger=logger)
 
     logger.info("Number of parameters: %d", sum(p.numel() for p in base_model.parameters()))
 
@@ -497,6 +558,12 @@ def main(args):
     assert accum_steps >= 1
 
     for epoch in range(args.epochs):
+        desired_connect = connect_method_for_epoch(schedule, epoch, default=res_conn)
+        if desired_connect != initial_connect:
+            # Switch without touching optimizer state (intentional).
+            set_connect(model.module, default=desired_connect, logger=(logger if rank == 0 else None))
+            initial_connect = desired_connect
+
         if train_steps > args.max_train_steps:
             if rank == 0:
                 print(f"Reached max training steps: {train_steps}. Stopping training.")
@@ -797,6 +864,26 @@ if __name__ == "__main__":
                         choices=["scalar", "conv1x1"],
                         default="scalar",
                         help="Mode for the rescale_stream pattern (scalar multiplier or 1x1 convolution).")
+    parser.add_argument(
+        "--residual_connection",
+        type=str,
+        default=None,
+        help="Explicit residual connection method override (e.g. 'linear', 'orthogonal', 'sde'). Overrides --orthogonal_residual.",
+    )
+    parser.add_argument(
+        "--connect_schedule",
+        type=str,
+        default=None,
+        help="Comma-separated schedule like '0:orthogonal,150:linear' (applied without optimizer reset).",
+    )
+    # Neural SDE (radial) hyper-parameters (used when residual_connection='sde' or schedule sets it)
+    parser.add_argument("--sde_alpha", type=float, default=0.0, help="Radial drift strength (Euler step scale).")
+    parser.add_argument("--sde_beta", type=float, default=None, help="Radial noise strength (if omitted, uses sqrt(2*alpha)).")
+    parser.add_argument("--sde_sigma2", type=float, default=1.0, help="Target isotropic Gaussian variance (radius chi params).")
+    parser.add_argument("--sde_trainable", action="store_true", help="Make (alpha,beta) learnable per block/branch.")
+    parser.add_argument("--sde_alpha_init", type=float, default=1e-3, help="Init alpha when --sde_trainable.")
+    parser.add_argument("--sde_beta_scale_init", type=float, default=0.0, help="Init log-scale for beta coupling when --sde_trainable.")
+    parser.add_argument("--sde_noise_mode", type=str, default="train", choices=["train", "always", "off"], help="When to apply radial noise.")
     parser.add_argument("--mlp_dropout", type=float, default=0.0)
     parser.add_argument("--drop_path", type=float, default=0.0)
     parser.add_argument("--is_layernorm_classifier", action="store_true",

@@ -10,9 +10,10 @@ https://github.com/weiaicunzai/pytorch-cifar100
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 from connect import ConnLoggerMixin
-from gradient_checkpointing import Unsloth_Offloaded_Gradient_Checkpointer
+from .gradient_checkpointing import Unsloth_Offloaded_Gradient_Checkpointer
 
 class PreActBasic(ConnLoggerMixin, nn.Module):
 
@@ -24,7 +25,15 @@ class PreActBasic(ConnLoggerMixin, nn.Module):
         log_interval=50, log_activations=True, 
         residual_connection="identity", orthogonal_method="global",
         residual_eps=1e-6, residual_perturbation=None,
-        residual_pattern="default", residual_rescale_mode="scalar"
+        residual_pattern="default", residual_rescale_mode="scalar",
+        # Neural SDE (radial) options (used when residual_connection="sde"/"chi"/"radial_sde")
+        sde_alpha: float = 0.0,
+        sde_beta: float | None = None,
+        sde_sigma2: float = 1.0,
+        sde_trainable: bool = False,
+        sde_alpha_init: float = 1e-3,
+        sde_beta_scale_init: float = 0.0,
+        sde_noise_mode: str = "train",  # "train" | "always" | "off"
     ):
         nn.Module.__init__(self)
         ConnLoggerMixin.__init__(self,
@@ -58,6 +67,15 @@ class PreActBasic(ConnLoggerMixin, nn.Module):
         if pattern == "rescale_stream":
             self._res_kwargs["rescale_mode"] = rescale_mode
         self._init_pattern_state(out_channels * PreActBasic.expansion, pattern, rescale_mode)
+        self._init_sde_state(
+            sde_alpha=sde_alpha,
+            sde_beta=sde_beta,
+            sde_sigma2=sde_sigma2,
+            sde_trainable=sde_trainable,
+            sde_alpha_init=sde_alpha_init,
+            sde_beta_scale_init=sde_beta_scale_init,
+            sde_noise_mode=sde_noise_mode,
+        )
     def _forward_impl(self, x):
 
         res = self.residual(x)
@@ -96,6 +114,35 @@ class PreActBasic(ConnLoggerMixin, nn.Module):
             else:
                 self._pattern_params["conv_rescale_alpha"] = nn.Parameter(torch.zeros(1))
 
+    def _init_sde_state(
+        self,
+        *,
+        sde_alpha: float,
+        sde_beta: float | None,
+        sde_sigma2: float,
+        sde_trainable: bool,
+        sde_alpha_init: float,
+        sde_beta_scale_init: float,
+        sde_noise_mode: str,
+    ) -> None:
+        # Fixed coefficients fallback (used when no trainable params are registered).
+        self.sde_alpha = float(sde_alpha)
+        self.sde_beta = None if sde_beta is None else float(sde_beta)
+        self.sde_sigma2 = float(sde_sigma2)
+        self.sde_noise_mode = str(sde_noise_mode)
+
+        if not sde_trainable:
+            return
+
+        def inv_softplus(x: float) -> float:
+            x = max(float(x), 1e-12)
+            return math.log(math.expm1(x))
+
+        raw_alpha_init = torch.tensor([inv_softplus(sde_alpha_init)], dtype=torch.float32)
+        beta_scale_init = torch.tensor([float(sde_beta_scale_init)], dtype=torch.float32)
+        self._pattern_params["conv_sde_raw_alpha"] = nn.Parameter(raw_alpha_init.clone())
+        self._pattern_params["conv_sde_raw_beta_scale"] = nn.Parameter(beta_scale_init.clone())
+
 class PreActBottleNeck(ConnLoggerMixin, nn.Module):
 
     expansion = 4
@@ -105,7 +152,15 @@ class PreActBottleNeck(ConnLoggerMixin, nn.Module):
         log_interval=50, log_activations=True, 
         residual_connection="identity", orthogonal_method="global",
         residual_eps=1e-6, residual_perturbation=None,
-        residual_pattern="default", residual_rescale_mode="scalar"
+        residual_pattern="default", residual_rescale_mode="scalar",
+        # Neural SDE (radial) options (used when residual_connection="sde"/"chi"/"radial_sde")
+        sde_alpha: float = 0.0,
+        sde_beta: float | None = None,
+        sde_sigma2: float = 1.0,
+        sde_trainable: bool = False,
+        sde_alpha_init: float = 1e-3,
+        sde_beta_scale_init: float = 0.0,
+        sde_noise_mode: str = "train",  # "train" | "always" | "off"
     ):
         nn.Module.__init__(self)
         ConnLoggerMixin.__init__(self,
@@ -146,6 +201,15 @@ class PreActBottleNeck(ConnLoggerMixin, nn.Module):
             self._res_kwargs["rescale_mode"] = rescale_mode
         channels = out_channels * PreActBottleNeck.expansion
         self._init_pattern_state(channels, pattern, rescale_mode)
+        self._init_sde_state(
+            sde_alpha=sde_alpha,
+            sde_beta=sde_beta,
+            sde_sigma2=sde_sigma2,
+            sde_trainable=sde_trainable,
+            sde_alpha_init=sde_alpha_init,
+            sde_beta_scale_init=sde_beta_scale_init,
+            sde_noise_mode=sde_noise_mode,
+        )
     
     def _forward_impl(self, x):
 
@@ -184,6 +248,35 @@ class PreActBottleNeck(ConnLoggerMixin, nn.Module):
                 self._pattern_modules["conv_rescale_proj"] = proj
             else:
                 self._pattern_params["conv_rescale_alpha"] = nn.Parameter(torch.zeros(1))
+
+    def _init_sde_state(
+        self,
+        *,
+        sde_alpha: float,
+        sde_beta: float | None,
+        sde_sigma2: float,
+        sde_trainable: bool,
+        sde_alpha_init: float,
+        sde_beta_scale_init: float,
+        sde_noise_mode: str,
+    ) -> None:
+        # Fixed coefficients fallback (used when no trainable params are registered).
+        self.sde_alpha = float(sde_alpha)
+        self.sde_beta = None if sde_beta is None else float(sde_beta)
+        self.sde_sigma2 = float(sde_sigma2)
+        self.sde_noise_mode = str(sde_noise_mode)
+
+        if not sde_trainable:
+            return
+
+        def inv_softplus(x: float) -> float:
+            x = max(float(x), 1e-12)
+            return math.log(math.expm1(x))
+
+        raw_alpha_init = torch.tensor([inv_softplus(sde_alpha_init)], dtype=torch.float32)
+        beta_scale_init = torch.tensor([float(sde_beta_scale_init)], dtype=torch.float32)
+        self._pattern_params["conv_sde_raw_alpha"] = nn.Parameter(raw_alpha_init.clone())
+        self._pattern_params["conv_sde_raw_beta_scale"] = nn.Parameter(beta_scale_init.clone())
 
 class PreActResNet(nn.Module):
 

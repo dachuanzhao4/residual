@@ -8,11 +8,14 @@ temp/
 
 ## byproducts
 checkpoints/
-data/
+data/*
+!data/**/*.py
+!data/**/
 dataset/
 logs/
 wandb/
 results/
+results-*/
 results-classifier/
 samples/
 exp/
