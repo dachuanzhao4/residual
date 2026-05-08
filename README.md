@@ -98,6 +98,15 @@ This checks:
 - IMB produces a clipped parallel component and emits diagnostics;
 - tiny ViT forward passes work for `linear`, `orthogonal`, and `imb`.
 
+For a stronger CPU-only implementation check:
+
+```bash
+python scripts/check_imb_cpu.py
+```
+
+This additionally verifies IMB special cases, a hand-computed budget formula,
+ViT forward/backward, trainable budget gradients, and the ResNet block path.
+
 ## Training
 
 ### Baselines
@@ -240,4 +249,3 @@ This repository is built on the official implementation of:
   url={https://arxiv.org/abs/2505.11881}
 }
 ```
-
