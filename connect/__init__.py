@@ -484,8 +484,8 @@ def connect(
         kappa = imb_kappa.to(device=x.device, dtype=torch.float32).clamp_min(0.0)
 
         x_norm = torch.sqrt(results.x_norm2.float().clamp_min(eps_tensor))
-        par_norm = torch.sqrt((results.f_par.float() * results.f_par.float()).sum(dim, keepdim=True).clamp_min(0.0))
-        ortho_norm = torch.sqrt((results.f_ortho.float() * results.f_ortho.float()).sum(dim, keepdim=True).clamp_min(0.0))
+        par_norm = torch.sqrt((results.f_par.float() * results.f_par.float()).sum(dim, keepdim=True).clamp_min(eps_tensor))
+        ortho_norm = torch.sqrt((results.f_ortho.float() * results.f_ortho.float()).sum(dim, keepdim=True).clamp_min(eps_tensor))
         radial_budget = tau * x_norm + kappa * ortho_norm
         lam = torch.clamp(radial_budget / (par_norm + eps_tensor), max=1.0)
 
