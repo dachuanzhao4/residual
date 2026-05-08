@@ -31,6 +31,12 @@ class OrthoBlock(ConnLoggerMixin, nn.Module):
         sde_alpha_init: float = 1e-3,
         sde_beta_scale_init: float = 0.0,
         sde_noise_mode: str = "train",  # "train" | "always" | "off"
+        # Innovation-Memory Budgeted Residuals (residual_connection="imb")
+        imb_tau: float = 0.0,
+        imb_kappa: float = 0.0,
+        imb_trainable: bool = False,
+        imb_tau_init: float = 0.0,
+        imb_kappa_init: float = 0.0,
         modulate=True,
         mlp_dropout=0.0,
         drop_path=0.0,
@@ -82,6 +88,13 @@ class OrthoBlock(ConnLoggerMixin, nn.Module):
             sde_alpha_init=sde_alpha_init,
             sde_beta_scale_init=sde_beta_scale_init,
             sde_noise_mode=sde_noise_mode,
+        )
+        self._init_imb_state(
+            imb_tau=imb_tau,
+            imb_kappa=imb_kappa,
+            imb_trainable=imb_trainable,
+            imb_tau_init=imb_tau_init,
+            imb_kappa_init=imb_kappa_init,
         )
 
 
@@ -163,3 +176,29 @@ class OrthoBlock(ConnLoggerMixin, nn.Module):
         self._pattern_params["mlp_sde_raw_alpha"] = nn.Parameter(raw_alpha_init.clone())
         self._pattern_params["attn_sde_raw_beta_scale"] = nn.Parameter(beta_scale_init.clone())
         self._pattern_params["mlp_sde_raw_beta_scale"] = nn.Parameter(beta_scale_init.clone())
+
+    def _init_imb_state(
+        self,
+        *,
+        imb_tau: float,
+        imb_kappa: float,
+        imb_trainable: bool,
+        imb_tau_init: float,
+        imb_kappa_init: float,
+    ) -> None:
+        self.imb_tau = float(imb_tau)
+        self.imb_kappa = float(imb_kappa)
+
+        if not imb_trainable:
+            return
+
+        def inv_softplus(x: float) -> float:
+            x = max(float(x), 1e-12)
+            return math.log(math.expm1(x))
+
+        raw_tau_init = torch.tensor([inv_softplus(imb_tau_init)], dtype=torch.float32)
+        raw_kappa_init = torch.tensor([inv_softplus(imb_kappa_init)], dtype=torch.float32)
+        self._pattern_params["attn_imb_raw_tau"] = nn.Parameter(raw_tau_init.clone())
+        self._pattern_params["mlp_imb_raw_tau"] = nn.Parameter(raw_tau_init.clone())
+        self._pattern_params["attn_imb_raw_kappa"] = nn.Parameter(raw_kappa_init.clone())
+        self._pattern_params["mlp_imb_raw_kappa"] = nn.Parameter(raw_kappa_init.clone())

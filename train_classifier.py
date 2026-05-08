@@ -284,7 +284,7 @@ def main(args):
     schedule = parse_connect_schedule(args.connect_schedule)
     initial_connect = connect_method_for_epoch(schedule, 0, default=res_conn)
 
-    ortho_method = args.orthogonal_method if initial_connect in ("orthogonal", "sde", "chi", "chi_sde", "radial_sde", "orthogonal_sde", "ours") else "linear"
+    ortho_method = args.orthogonal_method if initial_connect in ("orthogonal", "sde", "chi", "chi_sde", "radial_sde", "orthogonal_sde", "ours", "imb") else "linear"
     if args.orthogonal_method == "negative":
         ortho_method = "negative"
     run_name = f"{args.model}-{args.preset}/{patch_size}_{initial_connect}_{ortho_method}_{args.dataset}_seed{args.seed}"
@@ -403,6 +403,11 @@ def main(args):
             sde_alpha_init=args.sde_alpha_init,
             sde_beta_scale_init=args.sde_beta_scale_init,
             sde_noise_mode=args.sde_noise_mode,
+            imb_tau=args.imb_tau,
+            imb_kappa=args.imb_kappa,
+            imb_trainable=args.imb_trainable,
+            imb_tau_init=args.imb_tau_init,
+            imb_kappa_init=args.imb_kappa_init,
             # Activation & training logs share the same interval now
             log_interval=args.log_interval,
             log_activations=(rank == 0 and args.log_activations),
@@ -440,6 +445,11 @@ def main(args):
             sde_alpha_init=args.sde_alpha_init,
             sde_beta_scale_init=args.sde_beta_scale_init,
             sde_noise_mode=args.sde_noise_mode,
+            imb_tau=args.imb_tau,
+            imb_kappa=args.imb_kappa,
+            imb_trainable=args.imb_trainable,
+            imb_tau_init=args.imb_tau_init,
+            imb_kappa_init=args.imb_kappa_init,
             modulate=False,
             mlp_dropout=args.mlp_dropout,
             # Activation & training logs share the same interval now
@@ -484,14 +494,17 @@ def main(args):
         logger.info(model.module)
         log_residual_patterns(logger, model)
 
-    # Optimizer param groups (keep SDE scalars stable: low LR, no WD)
+    # Optimizer param groups (keep residual-geometry scalars stable: low LR, no WD)
     trainable_sde_params: list[torch.nn.Parameter] = []
+    trainable_imb_params: list[torch.nn.Parameter] = []
     other_params: list[torch.nn.Parameter] = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
         if ("sde_raw_alpha" in name) or ("sde_raw_beta_scale" in name):
             trainable_sde_params.append(param)
+        elif ("imb_raw_tau" in name) or ("imb_raw_kappa" in name):
+            trainable_imb_params.append(param)
         else:
             other_params.append(param)
 
@@ -508,6 +521,21 @@ def main(args):
                 len(trainable_sde_params),
                 args.lr * args.sde_param_lr_mult,
                 args.sde_param_weight_decay,
+                args.lr,
+                args.weight_decay,
+            )
+    if trainable_imb_params:
+        param_groups.append({
+            "params": trainable_imb_params,
+            "lr": args.lr * args.imb_param_lr_mult,
+            "weight_decay": args.imb_param_weight_decay,
+        })
+        if rank == 0:
+            logger.info(
+                "IMB param group: n=%d lr=%g wd=%g (base lr=%g wd=%g)",
+                len(trainable_imb_params),
+                args.lr * args.imb_param_lr_mult,
+                args.imb_param_weight_decay,
                 args.lr,
                 args.weight_decay,
             )
@@ -950,6 +978,24 @@ if __name__ == "__main__":
         type=float,
         default=0.0,
         help="Weight decay for trainable SDE scalars (raw alpha/beta).",
+    )
+    # Innovation-Memory Budgeted Residuals.
+    parser.add_argument("--imb_tau", type=float, default=0.0, help="Fixed memory budget coefficient for residual_connection='imb'.")
+    parser.add_argument("--imb_kappa", type=float, default=0.0, help="Fixed innovation-supported radial budget coefficient for residual_connection='imb'.")
+    parser.add_argument("--imb_trainable", action="store_true", help="Make IMB tau/kappa learnable per block/branch.")
+    parser.add_argument("--imb_tau_init", type=float, default=0.0, help="Initial tau when --imb_trainable.")
+    parser.add_argument("--imb_kappa_init", type=float, default=0.0, help="Initial kappa when --imb_trainable.")
+    parser.add_argument(
+        "--imb_param_lr_mult",
+        type=float,
+        default=0.1,
+        help="LR multiplier for trainable IMB budget scalars.",
+    )
+    parser.add_argument(
+        "--imb_param_weight_decay",
+        type=float,
+        default=0.0,
+        help="Weight decay for trainable IMB budget scalars.",
     )
     parser.add_argument("--mlp_dropout", type=float, default=0.0)
     parser.add_argument("--drop_path", type=float, default=0.0)

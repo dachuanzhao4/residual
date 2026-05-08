@@ -329,6 +329,8 @@ def connect(
     sde_beta: Optional[torch.Tensor] = None,
     sde_sigma2: float | torch.Tensor = 1.0,
     sde_noise: bool = True,
+    imb_tau: Optional[torch.Tensor] = None,
+    imb_kappa: Optional[torch.Tensor] = None,
     alpha: Optional[torch.Tensor] = None,
     theta: Optional[torch.Tensor] = None,
     rescale_alpha: Optional[torch.Tensor] = None,
@@ -458,6 +460,57 @@ def connect(
         delta_x_rad_norm2 = (delta_x_rad.detach() * delta_x_rad.detach()).sum(dim, keepdim=True).mean()
         results.extras["sde_delta_x_rad_norm2"] = delta_x_rad_norm2
         results.extras["sde_rho_rad"] = (delta_x_rad_norm2 / x_norm2.detach().mean().clamp_min(eps_tensor)).detach()
+        return stream, results
+    elif method == "imb":
+        if pattern not in ("default", "none"):
+            raise ValueError("imb connect method currently supports pattern 'default'/'none' only")
+        if imb_tau is None:
+            raise ValueError("imb connect method requires imb_tau tensor")
+        if imb_kappa is None:
+            raise ValueError("imb connect method requires imb_kappa tensor")
+
+        if orthogonal_method == "global":
+            _, results = _orthogonal_global(x, f_x, dim, eps_tensor)
+        elif orthogonal_method == "feature":
+            _, results = _orthogonal_channel(x, f_x, dim, eps_tensor)
+        else:
+            raise ValueError(f"unknown orthogonal method: {orthogonal_method}")
+
+        results = _ensure_components(results)
+        if results.f_par is None or results.f_ortho is None or results.x_norm2 is None:
+            raise RuntimeError("IMB expects decomposed parallel and orthogonal components")
+
+        tau = imb_tau.to(device=x.device, dtype=torch.float32).clamp_min(0.0)
+        kappa = imb_kappa.to(device=x.device, dtype=torch.float32).clamp_min(0.0)
+
+        x_norm = torch.sqrt(results.x_norm2.float().clamp_min(eps_tensor))
+        par_norm = torch.sqrt((results.f_par.float() * results.f_par.float()).sum(dim, keepdim=True).clamp_min(0.0))
+        ortho_norm = torch.sqrt((results.f_ortho.float() * results.f_ortho.float()).sum(dim, keepdim=True).clamp_min(0.0))
+        radial_budget = tau * x_norm + kappa * ortho_norm
+        lam = torch.clamp(radial_budget / (par_norm + eps_tensor), max=1.0)
+
+        kept_par = lam.to(dtype=x.dtype) * results.f_par
+        stream = x + results.f_ortho + kept_par
+        results.stream = stream
+        results.f_par = kept_par
+        results.f_x = results.f_ortho + kept_par
+        results.dot = (results.x * results.f_x).sum(dim, keepdim=True)
+        results.pattern = pattern
+
+        excess = torch.clamp(par_norm - radial_budget, min=0.0)
+        innovation_ratio = (
+            (ortho_norm * ortho_norm)
+            / ((ortho_norm * ortho_norm) + (par_norm * par_norm) + eps_tensor)
+        )
+        results.extras["imb_tau"] = tau.detach()
+        results.extras["imb_kappa"] = kappa.detach()
+        results.extras["imb_lambda_mean"] = lam.detach().mean()
+        results.extras["imb_clip_rate"] = (lam.detach() < 1.0).float().mean()
+        results.extras["imb_radial_budget_mean"] = radial_budget.detach().mean()
+        results.extras["imb_radial_excess_mean"] = excess.detach().mean()
+        results.extras["imb_innovation_ratio_mean"] = innovation_ratio.detach().mean()
+        results.extras["imb_par_norm_raw_mean"] = par_norm.detach().mean()
+        results.extras["imb_ortho_norm_raw_mean"] = ortho_norm.detach().mean()
         return stream, results
     elif method == "orthogonal":
         if orthogonal_method == "global":
@@ -813,6 +866,18 @@ class ConnLoggerMixin:
     def _method_kwargs(self, tag: str, method: str, x: torch.Tensor) -> Dict[str, Any]:
         method_norm = (method or "").strip().lower().replace("-", "_")
         method_norm = _METHOD_ALIASES.get(method_norm, method_norm)
+        if method_norm == "imb":
+            raw_tau_key = f"{tag}_imb_raw_tau"
+            raw_kappa_key = f"{tag}_imb_raw_kappa"
+            if isinstance(self._pattern_params, nn.ParameterDict) and raw_tau_key in self._pattern_params:
+                tau = F.softplus(self._pattern_params[raw_tau_key])
+                kappa = F.softplus(self._pattern_params[raw_kappa_key])
+                return {"imb_tau": tau, "imb_kappa": kappa}
+
+            tau = torch.tensor([float(getattr(self, "imb_tau", 0.0))], device=x.device, dtype=torch.float32)
+            kappa = torch.tensor([float(getattr(self, "imb_kappa", 0.0))], device=x.device, dtype=torch.float32)
+            return {"imb_tau": tau, "imb_kappa": kappa}
+
         if method_norm != "sde":
             return {}
 
