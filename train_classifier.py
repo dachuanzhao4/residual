@@ -130,6 +130,95 @@ def log_residual_patterns(logger: logging.Logger, module: torch.nn.Module) -> No
         logger.info("Residual pattern details: %s", ", ".join(parts))
 
 
+def _inv_softplus(x: float) -> float:
+    x = max(float(x), 1e-12)
+    return math.log(math.expm1(x))
+
+
+def _set_imb_trainable_value(module: torch.nn.Module, suffix: str, value: float) -> bool:
+    params = getattr(module, "_pattern_params", None)
+    if not isinstance(params, nn.ParameterDict):
+        return False
+
+    raw_value = torch.tensor([_inv_softplus(value)], dtype=torch.float32)
+    updated = False
+    for key, param in params.items():
+        if key.endswith(suffix):
+            param.data.copy_(raw_value.to(device=param.device, dtype=param.dtype))
+            updated = True
+    return updated
+
+
+def apply_imb_depth_schedule(
+    model: torch.nn.Module,
+    args: argparse.Namespace,
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    if args.imb_depth_schedule == "none":
+        return
+
+    blocks = [
+        module
+        for module in model.modules()
+        if hasattr(module, "imb_tau") and hasattr(module, "imb_kappa")
+    ]
+    if not blocks:
+        if logger is not None:
+            logger.info("IMB depth schedule requested, but no IMB-capable blocks were found.")
+        return
+
+    tau_start = args.imb_tau_early
+    tau_end = args.imb_tau_late
+    kappa_start = args.imb_kappa_early
+    kappa_end = args.imb_kappa_late
+
+    if tau_start is None:
+        tau_start = args.imb_tau_init if args.imb_trainable else args.imb_tau
+    if tau_end is None:
+        tau_end = tau_start
+    if kappa_start is None:
+        kappa_start = args.imb_kappa_init if args.imb_trainable else args.imb_kappa
+    if kappa_end is None:
+        kappa_end = kappa_start
+
+    denom = max(1, len(blocks) - 1)
+    for idx, block in enumerate(blocks):
+        t = idx / denom
+        tau = float(tau_start + (tau_end - tau_start) * t)
+        kappa = float(kappa_start + (kappa_end - kappa_start) * t)
+
+        updated_tau = _set_imb_trainable_value(block, "imb_raw_tau", tau)
+        updated_kappa = _set_imb_trainable_value(block, "imb_raw_kappa", kappa)
+        if not updated_tau:
+            block.imb_tau = tau
+        if not updated_kappa:
+            block.imb_kappa = kappa
+
+        if logger is not None:
+            logger.info(
+                "IMB schedule block %d/%d: tau=%g kappa=%g",
+                idx,
+                len(blocks) - 1,
+                tau,
+                kappa,
+            )
+
+
+def imb_budget_l1_penalty(model: torch.nn.Module) -> torch.Tensor:
+    penalty: Optional[torch.Tensor] = None
+    for name, param in model.named_parameters():
+        if ("imb_raw_tau" in name) or ("imb_raw_kappa" in name):
+            value = F.softplus(param).sum()
+            penalty = value if penalty is None else penalty + value
+
+    if penalty is not None:
+        return penalty
+    first_param = next(model.parameters(), None)
+    if first_param is None:
+        return torch.tensor(0.0)
+    return first_param.new_zeros(())
+
+
 def get_state_dict_for_save(m):
     m = unwrap_model(m)
     return m.state_dict()
@@ -470,6 +559,8 @@ def main(args):
         i = 0
         set_connect(base_model, pattern=pattern, logger=logger)
 
+    apply_imb_depth_schedule(base_model, args, logger=(logger if rank == 0 else None))
+
     # Apply connect schedule initial state (also supports torch.compile via set_connect).
     if schedule:
         set_connect(base_model, default=initial_connect, logger=logger)
@@ -670,6 +761,8 @@ def main(args):
             
             # Calculate loss outside AMP context to use full FP32 precision
             loss = criterion(logits, y)
+            if args.imb_budget_l1 > 0:
+                loss = loss + args.imb_budget_l1 * imb_budget_l1_penalty(model)
             # Scale loss for gradient accumulation (will be adjusted at the end if needed)
             loss = loss / accum_steps
             
@@ -985,6 +1078,23 @@ if __name__ == "__main__":
     parser.add_argument("--imb_trainable", action="store_true", help="Make IMB tau/kappa learnable per block/branch.")
     parser.add_argument("--imb_tau_init", type=float, default=0.0, help="Initial tau when --imb_trainable.")
     parser.add_argument("--imb_kappa_init", type=float, default=0.0, help="Initial kappa when --imb_trainable.")
+    parser.add_argument(
+        "--imb_depth_schedule",
+        type=str,
+        default="none",
+        choices=["none", "linear"],
+        help="Optionally initialize/set IMB budgets with an early-to-late depth schedule.",
+    )
+    parser.add_argument("--imb_tau_early", type=float, default=None, help="Early-layer tau for --imb_depth_schedule linear.")
+    parser.add_argument("--imb_tau_late", type=float, default=None, help="Late-layer tau for --imb_depth_schedule linear.")
+    parser.add_argument("--imb_kappa_early", type=float, default=None, help="Early-layer kappa for --imb_depth_schedule linear.")
+    parser.add_argument("--imb_kappa_late", type=float, default=None, help="Late-layer kappa for --imb_depth_schedule linear.")
+    parser.add_argument(
+        "--imb_budget_l1",
+        type=float,
+        default=0.0,
+        help="L1 penalty on learnable IMB tau/kappa budgets; encourages ORU-near fallback unless radial memory helps.",
+    )
     parser.add_argument(
         "--imb_param_lr_mult",
         type=float,

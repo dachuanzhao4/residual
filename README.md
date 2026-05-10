@@ -307,6 +307,28 @@ Interpretation:
 
 Pick 1-2 fixed budget settings for longer CIFAR-100/TinyImageNet runs.
 
+### 3.5 Resource-Limited Priority Runs
+
+If GPU time is limited, do not immediately chase a learned IMB run that beats
+ORU on CIFAR-10. CIFAR-10 already strongly favors ORU, and a freely learned
+budget can over-open the radial path. First run the smallest checks that answer
+whether the method is behaving as intended:
+
+```bash
+GPU_ID=0 SEED=0 EPOCHS_SHORT=50 bash scripts/run_resource_limited_imb_plan.sh
+```
+
+This runs:
+
+1. `tau=0, kappa=0` IMB fallback, which should behave like ORU.
+2. learned IMB with ORU-near initialization, small budget LR, and budget L1.
+3. fixed depth-scheduled IMB, with early layers close to ORU and later layers
+   more permissive.
+
+The most important follow-up full runs are CIFAR-100 `linear` and `orthogonal`,
+because the current CIFAR-100 IMB result cannot be interpreted without those
+baselines.
+
 ### 4. Main CIFAR-100 Runs
 
 Run the core comparison first on CIFAR-100:
