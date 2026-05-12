@@ -151,6 +151,13 @@ torchrun --nproc-per-node 1 train_classifier.py \
   --config_file configs/vit_s_cifar100_imb.yaml
 ```
 
+Learned depth-scheduled IMB on CIFAR-100:
+
+```bash
+torchrun --nproc-per-node 1 train_classifier.py \
+  --config_file configs/vit_s_cifar100_imb_learned_scheduled.yaml
+```
+
 The helper script is also available:
 
 ```bash
@@ -322,8 +329,9 @@ This runs:
 
 1. `tau=0, kappa=0` IMB fallback, which should behave like ORU.
 2. learned IMB with ORU-near initialization, small budget LR, and budget L1.
-3. fixed depth-scheduled IMB, with early layers close to ORU and later layers
-   more permissive.
+3. learned depth-scheduled IMB, initialized with early layers close to ORU and
+   later layers more permissive. The schedule is an initialization prior; the
+   budgets still train.
 
 The most important follow-up full runs are CIFAR-100 `linear` and `orthogonal`,
 because the current CIFAR-100 IMB result cannot be interpreted without those

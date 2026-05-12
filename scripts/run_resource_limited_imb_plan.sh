@@ -26,8 +26,9 @@ run "cifar10_imb_learned_oru_near" \
   --seed "${SEED}" \
   --epochs "${EPOCHS_SHORT}"
 
-# 3) Cheap fixed depth schedule: early ORU-like, late memory-permissive.
-run "cifar10_imb_depth_scheduled" \
-  --config_file configs/vit_s_cifar10_imb_scheduled.yaml \
+# 3) Cheap learned depth schedule: early ORU-like initialization, late memory-permissive initialization,
+#    but tau/kappa remain trainable.
+run "cifar10_imb_learned_depth_scheduled" \
+  --config_file configs/vit_s_cifar10_imb_learned_scheduled.yaml \
   --seed "${SEED}" \
   --epochs "${EPOCHS_SHORT}"
